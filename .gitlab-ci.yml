@@ -1,0 +1,341 @@
+variables:
+  GLOBAL_CI_REGISTRY_URL: "registry.gitlab.com/jtl-software/jtl-shop/core"
+  GIT_DEPTH: 1
+
+stages:
+  - codeQuality
+  - test
+  - build
+  - deploy
+  - cleanUp
+  - tagsDeployment
+  - stagingPre
+  - staging
+  - stagingMarketplaceDev
+
+
+.preBuildDeployScripts: &preBuildDeployScripts |
+  export CI_CONTAINER_NAME=ci-job-$CI_PROJECT_NAME-build-deploy-$CI_COMMIT_SHA
+  export SP_VERSION=$(echo "$CI_SERVER_VERSION" | sed 's/^\([0-9]*\)\.\([0-9]*\).*/\1-\2-stable/')
+  export BUILD_SCRIPT_PATH=build/scripts/build.sh
+  export DEPLOY_SCRIPT_PATH=build/scripts/deploy.sh
+  #export BUILD_IMAGE="build-deploy"       # ":latest" fallback
+  export BUILD_IMAGE="build-deploy:php81"
+
+  function dockerLogin() {
+    echo "Login to GitLab Container Registry with CI credentials..."
+    docker login -u gitlab-ci-token -p $CI_JOB_TOKEN $CI_REGISTRY
+    echo ""
+  }
+  function buildProcess() {
+    RAND_CHAR=$(date +%s|sha256sum|head -c 6)
+    DB_NAME="build_$RAND_CHAR"
+    DB_HOST_NET=$(docker network inspect -f '{{range .Containers}}{{if eq .Name "mariadb-10-2-container"}}{{.IPv4Address}}{{end}}{{end}}' mysql-php-network)
+    DB_HOST="${DB_HOST_NET::-3}"
+
+    #echo "Building projekt in docker image \"${BUILD_IMAGE}\" (based on MariaDB 10.3)..."
+    echo "Building projekt in docker image \"${BUILD_IMAGE:`expr index "${BUILD_IMAGE}" :` -1}\" (based on MariaDB 10.3)..."
+    docker run \
+      -d -it \
+      -w '/creation' \
+      --volume $CI_PROJECT_DIR.tmp/CI_SERVER_TLS_CA_FILE:$CI_PROJECT_DIR.tmp/CI_SERVER_TLS_CA_FILE \
+      --volume $(pwd):/dockerBuild \
+      --name="$CI_CONTAINER_NAME" \
+      --network mysql-php-network \
+      $GLOBAL_CI_REGISTRY_URL/$BUILD_IMAGE \
+      bash
+
+    docker exec \
+      -w '/creation' \
+      $CI_CONTAINER_NAME \
+      sh -c "cp -r /dockerBuild/. /creation; bash $BUILD_SCRIPT_PATH '/creation' $CI_COMMIT_REF_NAME $CI_COMMIT_SHA '$DB_HOST' 'root' '$DOCKER_MARIADB_PASSWORD' 'build_$DB_NAME'"
+
+    echo "Build finished"
+  }
+  function deployProcess() {
+    echo "Deploying archive to build server..."
+    docker start $CI_CONTAINER_NAME
+
+    docker exec \
+      -w '/creation' \
+      $CI_CONTAINER_NAME \
+      /bin/bash -c "bash $DEPLOY_SCRIPT_PATH $CI_PROJECT_NAME $CI_COMMIT_REF_NAME /archive"
+
+    docker cp $CI_CONTAINER_NAME:/archive/. $CI_BUILD_SERVER_ARCHIVE_PATH
+    docker network disconnect mysql-php-network $CI_CONTAINER_NAME
+    docker stop "$CI_CONTAINER_NAME"
+    docker rm -fv "$CI_CONTAINER_NAME" >/dev/null
+  }
+
+.postBuildDeployScripts: &postBuildDeployScripts |
+  function dockerLogout() {
+    echo "Logout from GitLab Container Registry with CI credentials..."
+    docker logout "$CI_REGISTRY"
+    echo ""
+  }
+
+.cleanUpScript: &cleanUpScript |
+  function failedScript() {
+    CI_CONTAINER_NAME=ci-job-$CI_PROJECT_NAME-build-deploy-$CI_COMMIT_SHA
+    running=$(docker inspect -f '{{.State.Running}}' $CI_CONTAINER_NAME)
+
+    if [[ ! -z "$running" ]]; then
+      docker network disconnect mysql-php-network $CI_CONTAINER_NAME
+      docker stop $CI_CONTAINER_NAME && docker rm -fv $CI_CONTAINER_NAME
+    fi
+  }
+
+.devCheckoutScripts: &devCheckoutScripts |
+  export FILENAME="${CI_COMMIT_REF_NAME//[\/\.]/-}";
+  export EXTRACTION_PATH="$RUNNER_PATH/shop-$FILENAME";
+
+  function downloadProcess() {
+    RUNNER_PATH_ZIP="$EXTRACTION_PATH.zip";
+    DOWNLOAD_URL="https://build.jtl-shop.de/get/shop-$FILENAME.zip";
+
+    curl -o $RUNNER_PATH_ZIP $DOWNLOAD_URL
+    unzip -qo $RUNNER_PATH_ZIP -d $EXTRACTION_PATH
+    rm $RUNNER_PATH_ZIP
+  }
+  function deployProcess() {
+    PHP_VERSION=$1;
+    DEPLOY_PATH="$STAGING_USER_PATH/php$PHP_VERSION/$FILENAME";
+    MIGRATION_COUNT_BEFORE=$(ls -1 $DEPLOY_PATH/update/migrations/ | wc -l);
+
+    sudo /usr/bin/rsync -rt -og --chown=www-data:www-data $EXTRACTION_PATH/. $DEPLOY_PATH;
+
+    MIGRATION_COUNT_AFTER=$(ls -1 $DEPLOY_PATH/update/migrations/ | wc -l);
+
+    if [[ $MIGRATION_COUNT_AFTER -gt $MIGRATION_COUNT_BEFORE ]]; then
+      php -r "
+      require_once '$DEPLOY_PATH/includes/globalinclude.php'; \
+      \$time    = date('YmdHis'); \
+      \$manager = new MigrationManager(Shop::Container()->getDB()); \
+      try { \
+          \$migrations = \$manager->migrate(\$time); \
+          foreach (\$migrations as \$migration) { \
+              echo \$migration->getName().' '.\$migration->getDescription().PHP_EOL; \
+          } \
+      } catch (Exception \$e) { \
+          \$migration = \$manager->getMigrationById(array_pop(array_reverse(\$manager->getPendingMigrations()))); \
+          \$result    = new IOError('Migration: '.\$migration->getName().' | Errorcode: '.\$e->getMessage()); \
+          echo \$result->message; \
+          return 1; \
+      } \
+      ";
+    fi
+  }
+
+
+.debugging: &debugging
+  script:
+    - if [ $CI_COMMIT_BRANCH ] ; then echo 'CI_COMMIT_BRANCH :' $CI_COMMIT_BRANCH; fi;                                                          # --DEBUG--
+    - if [ $CI_COMMIT_REF_NAME ] ; then echo 'CI_COMMIT_REF_NAME :' $CI_COMMIT_REF_NAME; fi;                                                    # --DEBUG--
+    - if [ $CI_MERGE_REQUEST_IID ] ; then echo 'CI_MERGE_REQUEST_IID :' $CI_MERGE_REQUEST_IID; fi;                                              # --DEBUG--
+    - if [ $CI_MERGE_REQUEST_ID ] ; then echo 'CI_MERGE_REQUEST_ID :' $CI_MERGE_REQUEST_ID; fi;                                                 # --DEBUG--
+    - if [ $CI_COMMIT_TAG ] ; then echo 'CI_COMMIT_TAG :' $CI_COMMIT_TAG; fi;                                                                   # --DEBUG--
+    - if [ $CI_PIPELINE_SOURCE ] ; then echo 'CI_PIPELINE_SOURCE :' $CI_PIPELINE_SOURCE; fi;                                                    # --DEBUG--
+    - if [ $CI_MERGE_REQUEST_EVENT_TYPE ] ; then echo 'CI_MERGE_REQUEST_EVENT_TYPE :' $CI_MERGE_REQUEST_EVENT_TYPE; fi;                         # --DEBUG--
+    - if [ $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME ] ; then echo 'CI_MERGE_REQUEST_SOURCE_BRANCH_NAME :' $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME; fi; # --DEBUG--
+    - if [ $CI_MERGE_REQUEST_TARGET_BRANCH_NAME ] ; then echo 'CI_MERGE_REQUEST_TARGET_BRANCH_NAME :' $CI_MERGE_REQUEST_TARGET_BRANCH_NAME; fi; # --DEBUG--
+    - if [ $CI_DEFAULT_BRANCH ] ; then echo 'CI_DEFAULT_BRANCH :' $CI_DEFAULT_BRANCH; fi;                                                       # --DEBUG--
+
+
+workflow:
+  rules:
+    - if: $CI_MERGE_REQUEST_ID
+      when: never
+    - when: always
+
+
+.ComposerInstall: &ComposerInstall |
+  # COMPOSER INSTALLATION
+  echo "] installing composer.."
+  php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');"
+  php -r "if (hash_file('sha384', 'composer-setup.php') === file_get_contents('https://composer.github.io/installer.sig')) { echo 'Installer verified'; } else { echo 'Installer corrupt'; unlink('composer-setup.php'); } echo PHP_EOL;"
+  php composer-setup.php && rm composer-setup.php
+  mv composer.phar composer
+
+
+.CodeSnifferInstallScript: &CodeSnifferInstallScript |
+  # CODESNIFFER INSTALLATION
+  echo "] remove default composer files.."
+  rm includes/composer.json includes/composer.lock
+  echo "] running phpcs install.."
+  ./composer -q require squizlabs/php_codesniffer:3.6.2 -d includes/
+
+.CodeSnifferRunScript: &CodeSnifferRunScript |
+  # CODESNIFFER RUN
+  echo "] writing phpcs config.."
+  php -r '$conf=["show_progress"=>"1","colors"=>"1","report_width"=>"90","encoding"=>"utf-8"];file_put_contents("includes/vendor/squizlabs/php_codesniffer/CodeSniffer.conf","<?php \$phpCodeSnifferConfig=".var_export($conf,true)."; ?>");'
+  echo "] create file list.."
+  find . -iname '*.php' >filelisting.txt
+  echo "] starting check script.."
+  build/scripts/codesniffer.sh .
+
+
+code_quality:
+  stage: codeQuality
+  image: php:7.3-alpine
+  before_script:
+    - *ComposerInstall
+    - *CodeSnifferInstallScript
+  script:
+    - *CodeSnifferRunScript
+  artifacts:
+    when: always
+    paths: [code-quality-report.txt]
+  rules:
+    - if: $CI_COMMIT_REF_NAME != $CI_DEFAULT_BRANCH
+        && $CI_COMMIT_REF_NAME !~ /^release\/.*$/
+        && $CI_COMMIT_TAG == null
+      when: always
+
+
+.runUnitTestDocker: &runUnitTestDocker |
+  # RUNNING DOCKER FOR UNIT TESTS
+  echo "] running with image:" $IMAGE_NAME
+  docker run \
+    --rm \
+    --name ci_unittests_${CI_RUNNER_SHORT_TOKEN}_${CI_COMMIT_SHORT_SHA} \
+    -v ${CI_PROJECT_DIR}:/repofolder \
+    ${GLOBAL_CI_REGISTRY_URL}/${IMAGE_NAME} \
+    /repofolder/build/scripts/tests.sh `id -u` `id -g`
+
+
+test_PHP_7.3:
+  stage: test
+  script:
+    - IMAGE_NAME=ci-tests:php73
+    - *runUnitTestDocker
+#  <<: *debugging
+  rules:
+    - if: $CI_PROJECT_PATH =~ /^jtl-software\/.*$/
+        && $CI_COMMIT_REF_NAME != $CI_DEFAULT_BRANCH
+        && $CI_COMMIT_REF_NAME !~ /^release\/.*$/
+        && $CI_COMMIT_TAG == null
+      when: on_success
+  tags:
+    - tests-run-73
+
+test_PHP_7.4:
+  stage: test
+  script:
+    - IMAGE_NAME=ci-tests:php74
+    - *runUnitTestDocker
+#  <<: *debugging
+  rules:
+    - if: $CI_PROJECT_PATH =~ /^jtl-software\/.*$/
+        && $CI_COMMIT_REF_NAME != $CI_DEFAULT_BRANCH
+        && $CI_COMMIT_REF_NAME !~ /^release\/.*$/
+        && $CI_COMMIT_TAG == null
+      when: on_success
+  tags:
+    - tests-run-74
+
+
+
+
+build:
+  stage: build
+  before_script:
+    - *preBuildDeployScripts
+    - dockerLogin
+  script:
+    - buildProcess
+#  <<: *debugging
+  after_script:
+    - *postBuildDeployScripts
+    - dockerLogout
+  rules:
+    - if: $CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH
+        || $CI_COMMIT_REF_NAME =~ /^release\/.*$/
+        || $CI_COMMIT_TAG == $CI_COMMIT_REF_NAME
+  tags:
+    - build
+
+deploy:
+  stage: deploy
+  variables:
+    GIT_STRATEGY: none
+  before_script:
+    - *preBuildDeployScripts
+    - dockerLogin
+  script:
+    - deployProcess
+    - buildscript pipeline:shop5up "$CI_PROJECT_DIR" "$CI_COMMIT_REF_NAME" "$CI_COMMIT_SHA"
+#  <<: *debugging
+  after_script:
+    - *postBuildDeployScripts
+    - dockerLogout
+  rules:
+    - if: $CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH
+        || $CI_COMMIT_REF_NAME =~ /^release\/.*$/
+        || $CI_COMMIT_TAG == $CI_COMMIT_REF_NAME
+      when: on_success
+  tags:
+    - build
+
+
+removeContainer:
+  stage: cleanUp
+  script:
+    - *cleanUpScript
+    - failedScript
+#  <<: *debugging
+  rules:
+    - if: $CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH
+        || $CI_COMMIT_REF_NAME =~ /^release\/.*$/
+        || $CI_COMMIT_TAG == $CI_COMMIT_REF_NAME
+      when: on_failure
+  tags:
+    - build
+
+
+
+tagsDeployment:
+  stage: tagsDeployment
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - buildscript release:deployment "$CI_BUILD_SERVER_ARCHIVE_PATH"
+#  <<: *debugging
+  rules:
+    - if: $CI_COMMIT_TAG == $CI_COMMIT_REF_NAME
+    - if: $CI_COMMIT_TAG == ''
+      when: never
+  tags:
+    - build
+
+
+
+.stagingPreDeploy:
+  stage: stagingPre
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - *devCheckoutScripts
+    - downloadProcess
+#  <<: *debugging
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+        || $CI_COMMIT_REF_NAME =~ /^release\/.*$/
+  tags:
+    - dev-checkout
+
+.stagingDevPhp73:
+  stage: staging
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - *devCheckoutScripts
+    - deployProcess 73
+#  <<: *debugging
+  environment:
+    name: staging master php 7.3
+    url: https://$STAGING_USER-73-master.$STAGING_DOMAIN
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+        || $CI_COMMIT_REF_NAME =~ /^release\/.*$/
+  tags:
+    - dev-checkout

@@ -1,0 +1,46 @@
+name: Roll back
+
+on:
+  workflow_dispatch:
+    inputs:
+      targetEnv:
+        description: 'Target Env'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+        - dev
+        - prd
+      targetBuildTag:
+        description: 'Target Build Tag. When set to "previous", it will find the previously deployed build tag. It can also be the specific verion, for example 23-main-11ae4f51e69cc3f516c9ce7a9d22944c5ac953c2.'
+        required: true
+        default: previous
+        type: string
+
+permissions:
+    contents: read
+
+jobs:
+  dev-rollback:
+    if: inputs.targetEnv == 'dev'
+    uses: ./.github/workflows/do-rollback.yml
+    with:
+      env: ${{inputs.targetEnv}}
+      build_tag: ${{inputs.targetBuildTag}}
+    secrets:
+      ssh_host: ${{secrets.DEV_SSH_HOST}}
+      ssh_port: ${{secrets.DEV_SSH_PORT}}
+      ssh_user: ${{secrets.DEV_SSH_USER}}
+      ssh_private_key: ${{secrets.DEPLOY_PRIVATE_KEY}}
+
+  prd-rollback:
+    if: inputs.targetEnv == 'prd'
+    uses: ./.github/workflows/do-rollback.yml
+    with:
+      env: ${{inputs.targetEnv}}
+      build_tag: ${{inputs.targetBuildTag}}
+    secrets:
+      ssh_host: ${{secrets.PRD_SSH_HOST}}
+      ssh_port: ${{secrets.PRD_SSH_PORT}}
+      ssh_user: ${{secrets.PRD_SSH_USER}}
+      ssh_private_key: ${{secrets.DEPLOY_PRIVATE_KEY}}

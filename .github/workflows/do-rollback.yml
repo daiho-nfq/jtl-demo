@@ -1,0 +1,81 @@
+name: Sub-workflow for Rollback
+
+on:
+  workflow_call:
+    inputs:
+      env:
+        required: true
+        type: string
+      build_tag:
+        required: true
+        type: string
+    secrets:
+      ssh_host:
+        required: true
+      ssh_port:
+        required: true
+      ssh_user:
+        required: true
+      ssh_private_key:
+        required: true
+
+permissions:
+    contents: read
+
+jobs:
+  symlink:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Check out nfq-ops
+      uses: actions/checkout@v3
+      with:
+        repository: goecommerce/nfq-ops
+        ref: main
+        path: nfq-ops
+        ssh-key: |
+          ${{secrets.ssh_private_key}}
+
+    - name: SSH config
+      run: |
+        cat > .ssh_config <<EOF
+        Host ${{inputs.env}}
+          HostName ${{ secrets.ssh_host }}
+          Port ${{ secrets.ssh_port }}
+          User ${{ secrets.ssh_user }}
+        Host *
+          StrictHostKeyChecking no
+        EOF
+        chmod 600 .ssh_config
+
+    - uses: webfactory/ssh-agent@v0.7.0
+      with:
+        ssh-private-key: |
+          ${{secrets.ssh_private_key}}
+
+    - name: Roll back
+      run: |
+        DEPLOY_SSH_USER=${{secrets.ssh_user}}
+        PROJECT_ENV=${{inputs.env}}
+        source .github/build.env
+
+        if [ "symlink" != "$DEPLOY_STRATEGY" ]; then
+          echo "::error::You can only roll back when deploy strategy is symlink"
+          exit 1
+        fi
+
+        if [[ "$PROJECT_ENV" == "dev" ]]; then
+          SYMLINK_TARGET="${SYMLINK_TARGET_DEV}"
+        elif [[ "$PROJECT_ENV" == "prd" ]]; then
+          SYMLINK_TARGET="${SYMLINK_TARGET_PRD}"
+        else
+          echo "::error::Unsupported PROJECT_ENV: $PROJECT_ENV"
+          exit 1;
+        fi
+
+        scp -F .ssh_config nfq-ops/onsite/*.sh ${{inputs.env}}:${SYMLINK_TMP_DIR}
+        ssh -F .ssh_config ${{inputs.env}} "bash ${SYMLINK_TMP_DIR}/symlinkrollback.sh $PROJECT_NAME ${{inputs.env}} $SYMLINK_DEPLOY_BASE_DIR $SYMLINK_TARGET ${{inputs.build_tag}}"
+
+    - name: Clean up
+      run: rm -f .ssh_config

@@ -1,0 +1,124 @@
+name: Build
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  validate-ops-secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - shell: bash
+        run: |
+          if [[ "" == "${{secrets.DEPLOY_PRIVATE_KEY}}" ]]; then
+            echo "::error::Please set secret: DEPLOY_PRIVATE_KEY"
+            exit 1
+          fi
+
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      build_tag: ${{ steps.project.outputs.build_tag }}
+      deploy_env: ${{ steps.project.outputs.deploy_env }}
+    steps:
+    - name: Project info
+      id: project
+      run: |
+        echo "build_tag=${{github.run_number}}-${{github.ref_name}}-${{github.sha}}" >> "$GITHUB_OUTPUT"
+
+        if [[ "${{github.ref_name}}" == "main" && "${{github.event_name}}" == "push" ]]; then
+          echo "deploy_env=dev" >> "$GITHUB_OUTPUT"
+          echo "::notice::This is a DEV build"
+        elif [[ "${{github.event_name}}" == "release" && "${{github.event.action}}" == "published" ]]; then
+          echo "deploy_env=prd" >> "$GITHUB_OUTPUT"
+          echo "::notice::This is a PRD build"
+        fi
+
+  validate-dev-ssh-secrets:
+    needs: [prepare, validate-ops-secrets]
+    if: needs.prepare.outputs.deploy_env == 'dev'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        secret:
+          - SSH_HOST
+          - SSH_PORT
+          - SSH_USER
+    steps:
+      - shell: bash
+        run: |
+          if [[ "" == "${{secrets[format('PRD_{0}', matrix.secret)]}}" ]]; then
+            echo "::error::Please set secret: PRD_${{matrix.secret}}"
+            exit 1
+          fi
+
+  validate-dev-shop-vars:
+    needs: [prepare, validate-ops-secrets]
+    if: needs.prepare.outputs.deploy_env == 'dev'
+    uses: ./.github/workflows/validate-vars.yml
+    with:
+      env: DEV
+    secrets:
+      vars: ${{secrets.DEV_VARS}}
+
+  dev:
+    needs: [prepare, validate-ops-secrets, validate-dev-ssh-secrets, validate-dev-shop-vars]
+    if: needs.prepare.outputs.deploy_env == 'dev'
+    uses: ./.github/workflows/deploy.yml
+    with:
+      project_env: dev
+      build_tag: ${{needs.prepare.outputs.build_tag}}
+    secrets:
+      ssh_host: ${{secrets.DEV_SSH_HOST}}
+      ssh_port: ${{secrets.DEV_SSH_PORT}}
+      ssh_user: ${{secrets.DEV_SSH_USER}}
+      ssh_private_key: ${{secrets.DEPLOY_PRIVATE_KEY}}
+      vars: ${{secrets.DEV_VARS}}
+
+  validate-prd-ssh-secrets:
+    needs: [prepare, validate-ops-secrets]
+    if: needs.prepare.outputs.deploy_env == 'prd'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        secret:
+          - SSH_HOST
+          - SSH_PORT
+          - SSH_USER
+    steps:
+      - shell: bash
+        run: |
+          if [[ "" == "${{secrets[format('PRD_{0}', matrix.secret)]}}" ]]; then
+            echo "::error::Please set secret: PRD_${{matrix.secret}}"
+            exit 1
+          fi
+
+  validate-prd-shop-vars:
+    needs: [prepare, validate-ops-secrets]
+    if: needs.prepare.outputs.deploy_env == 'prd'
+    uses: ./.github/workflows/validate-vars.yml
+    with:
+      env: PRD
+    secrets:
+      vars: ${{secrets.PRD_VARS}}
+
+  prod:
+    needs: [prepare, validate-ops-secrets, validate-prd-ssh-secrets, validate-prd-shop-vars]
+    if: needs.prepare.outputs.deploy_env == 'prd'
+    uses: ./.github/workflows/deploy.yml
+    with:
+      project_env: prd
+      build_tag: ${{needs.prepare.outputs.build_tag}}
+    secrets:
+      ssh_host: ${{secrets.PRD_SSH_HOST}}
+      ssh_port: ${{secrets.PRD_SSH_PORT}}
+      ssh_user: ${{secrets.PRD_SSH_USER}}
+      ssh_private_key: ${{secrets.DEPLOY_PRIVATE_KEY}}
+      vars: ${{secrets.PRD_VARS}}

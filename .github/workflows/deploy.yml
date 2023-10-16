@@ -1,0 +1,146 @@
+name: Sub-workflow for Deployment
+
+on:
+  workflow_call:
+    inputs:
+      project_env:
+        required: true
+        type: string
+      build_tag:
+        required: true
+        type: string
+    secrets:
+      ssh_host:
+        required: true
+      ssh_port:
+        required: true
+      ssh_user:
+        required: true
+      ssh_private_key:
+        required: true
+      vars:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: webfactory/ssh-agent@v0.7.0
+      with:
+        ssh-private-key: |
+          ${{secrets.ssh_private_key}}
+
+    - uses: actions/checkout@v3
+
+    - name: Check out nfq-ops
+      uses: actions/checkout@v3
+      with:
+        repository: goecommerce/nfq-ops
+        ref: main
+        path: nfq-ops
+        ssh-key: |
+          ${{secrets.ssh_private_key}}
+
+    - name: Set up build ENV
+      run: |
+        echo "PROJECT_ENV=${{inputs.project_env}}" >> "$GITHUB_ENV"
+        echo "DEPLOY_SSH_USER=${{secrets.ssh_user}}" >> "$GITHUB_ENV"
+
+    - name: Cache Composer packages
+      id: composer-cache
+      uses: actions/cache@v3
+      with:
+        path: includes/vendor
+        key: ${{ runner.os }}-php-${{ hashFiles('includes/composer.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-php-
+
+    - name: SSH config
+      run: |
+        cat > .ssh_config <<EOF
+        Host ${{inputs.project_env}}
+          HostName ${{ secrets.ssh_host }}
+          Port ${{ secrets.ssh_port }}
+          User ${{ secrets.ssh_user }}
+        Host *
+          StrictHostKeyChecking no
+        EOF
+        chmod 600 .ssh_config
+
+    - name: Set up deploy ENV
+      run: |
+        source .github/build.env
+
+        vars_file=${SYMLINK_TMP_DIR}/${PROJECT_NAME}-${PROJECT_ENV}_vars.env
+
+        ssh -F .ssh_config ${{inputs.project_env}} bash <<EOF
+        # begin of remote bash script
+
+        cat > $vars_file <<EOT
+        ${{secrets.vars}}
+        EOT
+
+        chmod 600 $vars_file
+
+        # end of remote bash script
+        EOF
+
+    - name: Bundle
+      run: |
+        source .github/build.env
+
+        echo "Date:       $(date)" > build.log
+        echo "Branch:     ${{github.ref_name}}" >> build.log
+        echo "Ref:        ${{github.sha}}" >> build.log
+        echo "Run Number: ${{github.run_number}}" >> build.log
+        echo "Attempt:    ${{github.run_attempt}}" >> build.log
+        echo "Build Tag:  ${{inputs.build_tag}}" >> build.log
+        echo "Desc:       $(git show -s --format=%B HEAD)" >> build.log
+
+        composer install --prefer-dist --no-progress --working-dir=includes --ignore-platform-reqs --no-dev
+
+        rm -rf .git .asset_cs .php_cs build
+
+        rm -f ../${{inputs.build_tag}}.tar.gz
+        tar czf ../${{inputs.build_tag}}.tar.gz .
+
+    - name: Publish
+      run: |
+        source .github/build.env
+
+        scp -F .ssh_config ../${{inputs.build_tag}}.tar.gz nfq-ops/onsite/*.sh $PROJECT_ENV:${SYMLINK_TMP_DIR}
+        rm -f ../${{inputs.build_tag}}.tar.gz
+
+    - name: Deploy
+      run: |
+        source .github/build.env
+
+        if [ "symlink" == "$DEPLOY_STRATEGY" ]; then
+          if [[ "$PROJECT_ENV" == "dev" ]]; then
+            SYMLINK_TARGET="${SYMLINK_TARGET_DEV}"
+          elif [[ "$PROJECT_ENV" == "prd" ]]; then
+            SYMLINK_TARGET="${SYMLINK_TARGET_PRD}"
+          else
+            echo "::error::Unsupported PROJECT_ENV: $PROJECT_ENV"
+            exit 1;
+          fi
+
+          echo PROJECT_NAME:            $PROJECT_NAME
+          echo PROJECT_ENV:             $PROJECT_ENV
+          echo SYMLINK_DEPLOY_BASE_DIR: $SYMLINK_DEPLOY_BASE_DIR
+          echo SYMLINK_DATA_BASE_DIR:   $SYMLINK_DATA_BASE_DIR
+          echo SYMLINK_TARGET:          $SYMLINK_TARGET
+          echo build_tag:               ${{inputs.build_tag}}
+
+          ssh -F .ssh_config $PROJECT_ENV "bash ${SYMLINK_TMP_DIR}/symlinkdeploy.sh $PROJECT_NAME $PROJECT_ENV $SYMLINK_DEPLOY_BASE_DIR $SYMLINK_DATA_BASE_DIR $SYMLINK_TARGET ${{inputs.build_tag}}"
+        else
+          echo ":error::Unsupported deploy strategy: $DEPLOY_STRATEGY"
+          exit 1
+        fi
+
+    - name: Clean up
+      run: rm -f .ssh_config

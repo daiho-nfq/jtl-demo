@@ -1,0 +1,35 @@
+name: Sub-workflow for validating shop vars
+
+on:
+  workflow_call:
+    inputs:
+      env:
+        type: string
+        required: true
+    secrets:
+      vars:
+        required: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        var:
+          - SHOP_URL
+          - DATABASE_HOST
+          - DATABASE_NAME
+          - DATABASE_USERNAME
+          - DATABASE_PASSWORD
+          - ADMIN_USERNAME
+          - ADMIN_PASSWORD
+          - SYNC_USERNAME
+          - SYNC_PASSWORD
+    steps:
+      - shell: bash
+        run: |
+          eval '${{secrets.vars}}'
+          if [[ "" == "${${{matrix.var}}}" ]]; then
+            echo "::error::Please set var ${{matrix.var}} in: ${{inputs.env}}_VARS"
+            exit 1
+          fi
