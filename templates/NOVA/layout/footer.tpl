@@ -1,7 +1,7 @@
 {block name='layout-footer'}
 
     {block name='layout-footer-content-all-closingtags'}
-
+      <h1>HELLO</h1>
         {block name='layout-footer-aside'}
             {if !$bExclusive && $boxes.left !== null && !empty(trim(strip_tags($boxes.left)))
                 && (($Einstellungen.template.theme.left_sidebar === 'Y' && $boxesLeftActive) || $smarty.const.PAGE_ARTIKELLISTE === $nSeitenTyp)}
