@@ -79,8 +79,7 @@ jobs:
       ssh_host: ${{secrets.DEV_SSH_HOST}}
       ssh_port: ${{secrets.DEV_SSH_PORT}}
       ssh_user: ${{secrets.DEV_SSH_USER}}
-      ssh_private_key: |
-        ${{secrets.DEPLOY_PRIVATE_KEY}}
+      ssh_private_key: ${{secrets.DEPLOY_PRIVATE_KEY}}
       vars: ${{secrets.DEV_VARS}}
 
   validate-prd-ssh-secrets:
