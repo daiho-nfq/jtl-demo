@@ -75,10 +75,6 @@ jobs:
       run: |
         source .github/build.env
 
-        set -xe
-
-        ssh -F .ssh_config ${{inputs.project_env}} bash 'ls -l'
-
         vars_file=${SYMLINK_TMP_DIR}/${PROJECT_NAME}-${PROJECT_ENV}_vars.env
 
         ssh -F .ssh_config ${{inputs.project_env}} bash <<EOF
