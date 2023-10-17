@@ -474,6 +474,7 @@
     {/if}
 
     {block name='layout-header-main-wrapper-starttag'}
+        <h1>Hello from Demo</h1>
         <main id="main-wrapper" class="{if $bExclusive} exclusive{/if}{if $hasLeftPanel} aside-active{/if}">
         {opcMountPoint id='opc_before_main' inContainer=false}
     {/block}
